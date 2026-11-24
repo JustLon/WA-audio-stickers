@@ -2,7 +2,7 @@
 
 # Stickers con sonido
 
-Extensión para Chrome, Edge o Brave que convierte un video en un **sticker con sonido** y lo envía desde **WhatsApp Web**. Todo se procesa en tu navegador: nada se sube a otro servidor que no sea WhatsApp.
+Extensión para Chrome, Edge o Brave que convierte un video, una imagen o un GIF en un **sticker con sonido** y lo envía desde **WhatsApp Web**. Todo se procesa en tu navegador: nada se sube a otro servidor que no sea WhatsApp.
 
 > **Aviso:** proyecto personal, **no oficial**, sin relación con WhatsApp ni con Meta. Usa funciones internas de WhatsApp Web que pueden cambiar en cualquier momento, y activa en tu navegador la función de stickers con sonido, que WhatsApp está probando. Úsalo bajo tu propia responsabilidad.
 
@@ -37,7 +37,12 @@ Las capturas son de Brave. En Chrome y Edge se ve igual, con otros colores.
 ## Uso
 
 1. Abre [web.whatsapp.com](https://web.whatsapp.com) y entra al chat donde quieres enviar el sticker.
-2. Pulsa el icono violeta de la extensión. Se abre el panel con cuatro pasos:
+2. Pulsa el icono violeta de la extensión. El panel tiene tres pestañas, cada una con su formulario:
+   - **Video:** un video con su propio sonido (los pasos de abajo).
+   - **Imagen + audio:** una imagen fija con el sonido que elijas (MP3, M4A, OGG, WAV o el sonido de un video). Recortas el audio con asas sobre su forma de onda y el sticker dura lo que dure ese tramo.
+   - **Video o GIF + audio:** una animación (un video sin su sonido, o un GIF) con otro audio. Si duran distinto, por defecto cada uno dura lo suyo: al tocar el sticker empiezan juntos y terminan por separado. También puedes repetir la animación o dejar quieto su último cuadro hasta que acabe el audio. Cambiar el tramo de audio no obliga a recalcular las opciones.
+
+   En la pestaña **Video** hay cuatro pasos:
    1. **Video:** elige un video con sonido.
    2. **Tramo:** arrastra las asas verdes para marcar el inicio y el fin. El video muestra el cuadro exacto, y **−/+** mueven un cuadro.
    3. **Formato:** pulsa **Calcular opciones**. Aparece una tabla de resolución × fps con el peso estimado de cada combinación:

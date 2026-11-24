@@ -1,5 +1,5 @@
-// Conversión en el navegador: video -> sticker WebP animado + audio Ogg/Opus (formato de WhatsApp).
-// No depende de WhatsApp; usa <video>, canvas (WebP), WebAudio y WebCodecs.
+// Conversión en el navegador: video, GIF o imagen + audio -> sticker WebP + audio Ogg/Opus (formato de WhatsApp).
+// No depende de WhatsApp; usa <video>, ImageDecoder (GIF), canvas (WebP), WebAudio y WebCodecs.
 (() => {
   const WAAS = (window.WAAS = window.WAAS || {});
   const log = (lvl, ev, data) => (WAAS.log ? WAAS.log(lvl, ev, data) : console.log(ev, data));
@@ -91,8 +91,12 @@
     });
   }
 
+  // Dimensiones de cualquier fuente dibujable: <video>, VideoFrame (GIF) o ImageBitmap (imagen).
+  const srcW = (s) => s.videoWidth || s.displayWidth || s.width;
+  const srcH = (s) => s.videoHeight || s.displayHeight || s.height;
+
   function drawFrame(ctx, v, mode, side) {
-    const vw = v.videoWidth, vh = v.videoHeight;
+    const vw = srcW(v), vh = srcH(v);
     ctx.clearRect(0, 0, side, side);
     const s = mode === "recortar" ? Math.max(side / vw, side / vh) : Math.min(side / vw, side / vh);
     const w = vw * s, h = vh * s;
@@ -241,6 +245,128 @@
     }
   }
 
+  // ---------------------------------------------------------------- GIF e imágenes
+  // GIF, WebP animado y APNG se decodifican con ImageDecoder (WebCodecs): <video> no los abre.
+  const animCache = new WeakMap(); // File -> { durs (ms por cuadro), width, height }
+
+  function isAnimationFile(file) {
+    return /^image\/(gif|webp|png|apng)$/i.test(file.type || "") || /\.(gif|webp|png|apng)$/i.test(file.name || "");
+  }
+
+  function imageType(file) {
+    if (file.type && file.type.startsWith("image/")) return file.type;
+    const ext = (file.name || "").split(".").pop().toLowerCase();
+    return { gif: "image/gif", webp: "image/webp", png: "image/png", apng: "image/apng", jpg: "image/jpeg", jpeg: "image/jpeg" }[ext] || "image/gif";
+  }
+
+  async function openDecoder(file) {
+    if (typeof ImageDecoder === "undefined") throw new Error("Este navegador no puede leer GIF animados (falta ImageDecoder). Usa Chrome o Edge actualizados.");
+    const type = imageType(file);
+    if (!(await ImageDecoder.isTypeSupported(type))) throw new Error("El navegador no puede leer imágenes " + type);
+    const dec = new ImageDecoder({ data: await file.arrayBuffer(), type });
+    await dec.completed;
+    await dec.tracks.ready;
+    return dec;
+  }
+
+  // Duración de cada cuadro. Los navegadores muestran a 100 ms los cuadros de GIF que dicen durar
+  // 10 ms o menos (muchos GIF viejos dicen 0); aquí se hace lo mismo para que se vea igual.
+  async function probeAnimation(file) {
+    if (animCache.has(file)) return animCache.get(file);
+    const dec = await openDecoder(file);
+    try {
+      const track = dec.tracks.selectedTrack;
+      const n = track ? track.frameCount : 1;
+      const durs = [];
+      let width = 0, height = 0;
+      for (let i = 0; i < n; i++) {
+        const { image } = await dec.decode({ frameIndex: i });
+        if (!i) { width = image.displayWidth; height = image.displayHeight; }
+        const ms = image.duration != null ? image.duration / 1000 : 0;
+        durs.push(ms > 10 ? ms : 100);
+        image.close();
+      }
+      const info = { frames: n, durs, duration: n > 1 ? durs.reduce((a, b) => a + b, 0) / 1000 : 0, width, height, animated: n > 1 };
+      animCache.set(file, info);
+      return info;
+    } finally {
+      dec.close();
+    }
+  }
+
+  // Captura un GIF a fps fijo durante dur segundos (si dur supera al GIF, este se repite).
+  async function captureAnimation(file, dur, fps, side, mode, onProgress, signal) {
+    const t0 = performance.now();
+    const info = await probeAnimation(file);
+    const ends = [];
+    let acc = 0;
+    for (const d of info.durs) { acc += d; ends.push(acc); }
+    const total = acc || 1;
+    const n = Math.max(1, Math.round(dur * fps));
+    const want = [];
+    for (let i = 0; i < n; i++) {
+      const t = (((i + 0.5) * 1000) / fps) % total;
+      let k = 0;
+      while (k < ends.length - 1 && ends[k] <= t) k++;
+      want.push(k);
+    }
+    const needed = [...new Set(want)].sort((a, b) => a - b);
+    const snap = makeSnapper(side, mode);
+    const byIndex = new Map();
+    const dec = await openDecoder(file);
+    try {
+      for (let j = 0; j < needed.length; j++) {
+        checkAbort(signal);
+        const { image } = await dec.decode({ frameIndex: needed[j] });
+        const s = snap(image);
+        image.close();
+        byIndex.set(needed[j], { bmp: await s.bmpPromise, fp: s.fp });
+        if (onProgress && (j % 5 === 0 || j === needed.length - 1)) onProgress(`Leyendo cuadros del GIF ${j + 1}/${needed.length}`, (j + 1) / needed.length);
+      }
+    } finally {
+      dec.close();
+    }
+    const frames = want.map((k) => byIndex.get(k));
+    log("info", "gif:cuadros", { cuadrosGif: info.frames, usados: needed.length, cuadros: frames.length, fpsCaptura: fps, ladoCaptura: side, duracionGif: info.duration, ms: Math.round(performance.now() - t0) });
+    return frames;
+  }
+
+  // Imagen fija (JPG, PNG, WebP…). En un GIF se toma el primer cuadro.
+  async function probeImage(file) {
+    let bmp;
+    try { bmp = await createImageBitmap(file); } catch (e) { throw new Error("El navegador no pudo leer la imagen (" + (e && e.message ? e.message : e) + ")"); }
+    const out = { width: bmp.width, height: bmp.height, animated: false };
+    bmp.close();
+    if (isAnimationFile(file) && typeof ImageDecoder !== "undefined") {
+      try { out.animated = (await probeAnimation(file)).animated; } catch (e) { /* se usa como imagen fija */ }
+    }
+    return out;
+  }
+
+  async function captureImage(file, side, mode) {
+    const bmp = await createImageBitmap(file);
+    try {
+      const s = makeSnapper(side, mode)(bmp);
+      return { bmp: await s.bmpPromise, fp: s.fp };
+    } finally {
+      bmp.close();
+    }
+  }
+
+  // Línea de tiempo del sticker: los cuadros capturados (que cubren capDur) se reparten en dur
+  // segundos. Si dur es mayor, la animación se repite ("repetir") o se queda en su último cuadro.
+  function fitTimeline(captured, capDur, dur, fps, fit) {
+    const n = Math.max(1, Math.round(dur * fps));
+    if (n === captured.length) return captured;
+    const out = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const t = (i + 0.5) / fps;
+      const tv = fit === "repetir" ? t % capDur : Math.min(t, capDur);
+      out[i] = captured[Math.max(0, Math.min(captured.length - 1, Math.floor(tv * fps)))];
+    }
+    return out;
+  }
+
   // ---------------------------------------------------------------- WebP
   function readChunks(bytes) {
     const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -316,6 +442,20 @@
     return concat([riff, body]);
   }
 
+  // WebP fijo (un solo cuadro, sin animación) con los metadatos de WhatsApp.
+  function buildStillWebp(frame, exif, side = SIDE) {
+    const vp8x = new Uint8Array(10);
+    vp8x[0] = (frame.hasAlpha ? 0x10 : 0) | (exif ? 0x08 : 0);
+    u24(vp8x, 4, side - 1);
+    u24(vp8x, 7, side - 1);
+    const body = concat([chunk("VP8X", vp8x), frame.payload].concat(exif ? [chunk("EXIF", exif)] : []));
+    const riff = new Uint8Array(12);
+    riff.set(te.encode("RIFF"), 0);
+    new DataView(riff.buffer).setUint32(4, 4 + body.length, true);
+    riff.set(te.encode("WEBP"), 8);
+    return concat([riff, body]);
+  }
+
   function exifWhatsApp(meta) {
     // Bloque TIFF big-endian con un único tag 0x5741 ("WA") que contiene el JSON (igual que WhatsApp).
     const js = te.encode(JSON.stringify(meta));
@@ -355,7 +495,7 @@
 
   // Codifica el sticker para un lado y fps dados. Empieza con la calidad del lado y la baja
   // solo si hace falta para no pasar de 1 MB.
-  async function encodeWebp(an, side, fps, exifMeta, { onProgress, signal, syncMs = 0 }) {
+  async function encodeWebp(an, side, fps, exifMeta, { onProgress, signal, syncMs = 0, still = false }) {
     const { frames, dur, captureFps } = an;
     const canvas = new OffscreenCanvas(side, side);
     const ctx = canvas.getContext("2d");
@@ -390,8 +530,8 @@
         if (onProgress && k % 10 === 0) onProgress(`Codificando (${side} px, ${fps} fps, calidad ${Math.round(q * 100)}) ${k + 1}/${p.length}`, (k + 1) / p.length);
       }
       // Compensación de desfase: el primer cuadro se muestra syncMs más, para que la imagen espere al audio.
-      if (syncMs > 0) out[0] = { ...out[0], durationMs: out[0].durationMs + syncMs };
-      const bytes = buildAnimatedWebp(out, exifWhatsApp(exifMeta), side);
+      if (syncMs > 0 && !still) out[0] = { ...out[0], durationMs: out[0].durationMs + syncMs };
+      const bytes = still ? buildStillWebp(out[0], exifWhatsApp(exifMeta), side) : buildAnimatedWebp(out, exifWhatsApp(exifMeta), side);
       attempts.push({ q, bytes: bytes.length, cuadros: out.length });
       best = { bytes, side, fps, q, frames: out.length };
       if (bytes.length <= MAX_STICKER_BYTES) break;
@@ -419,17 +559,46 @@
   }
 
   // ---------------------------------------------------------------- audio
-  async function extractAudio(file, start, dur) {
-    const buf = await file.arrayBuffer();
-    let decoded;
-    try {
-      const dctx = new OfflineAudioContext(1, SAMPLE_RATE, SAMPLE_RATE);
-      decoded = await dctx.decodeAudioData(buf);
-    } catch (e) {
-      const err = new Error("No se pudo extraer el audio del video. ¿El video tiene sonido? (" + (e && e.message ? e.message : e) + ")");
-      err.cause = e;
-      throw err;
+  // El audio decodificado se guarda por archivo: la forma de onda y la creación no lo decodifican dos veces.
+  const audioCache = new WeakMap();
+  function decodeAudioFile(file) {
+    if (!audioCache.has(file)) {
+      const p = (async () => {
+        const buf = await file.arrayBuffer();
+        try {
+          const dctx = new OfflineAudioContext(1, SAMPLE_RATE, SAMPLE_RATE);
+          return await dctx.decodeAudioData(buf);
+        } catch (e) {
+          const err = new Error("No se pudo leer el audio. ¿El archivo tiene sonido? (" + (e && e.message ? e.message : e) + ")");
+          err.cause = e;
+          throw err;
+        }
+      })();
+      p.catch(() => audioCache.delete(file));
+      audioCache.set(file, p);
     }
+    return audioCache.get(file);
+  }
+
+  // Duración y forma de onda (picos por tramo) de un archivo de audio o de video.
+  async function probeAudio(file, buckets = 1200) {
+    const d = await decodeAudioFile(file);
+    const chans = Array.from({ length: d.numberOfChannels }, (_, c) => d.getChannelData(c));
+    const per = Math.max(1, Math.floor(d.length / buckets));
+    const peaks = new Float32Array(Math.ceil(d.length / per));
+    let max = 0;
+    for (let b = 0; b < peaks.length; b++) {
+      let p = 0;
+      const end = Math.min(d.length, (b + 1) * per);
+      for (const ch of chans) for (let i = b * per; i < end; i += 4) { const a = Math.abs(ch[i]); if (a > p) p = a; }
+      peaks[b] = p;
+      if (p > max) max = p;
+    }
+    return { duration: d.duration, channels: d.numberOfChannels, peaks, peakMax: max };
+  }
+
+  async function extractAudio(file, start, dur, fadeMs = 0) {
+    const decoded = await decodeAudioFile(file);
     if (decoded.duration < start + 0.05) throw new Error(`El audio dura ${decoded.duration.toFixed(2)} s y el tramo empieza en ${start.toFixed(2)} s`);
     const len = Math.max(1, Math.round(dur * SAMPLE_RATE));
     const octx = new OfflineAudioContext(1, len, SAMPLE_RATE);
@@ -439,6 +608,11 @@
     src.start(0, start, dur);
     const rendered = await octx.startRendering();
     const pcm = rendered.getChannelData(0);
+    // Fundido muy corto en los bordes: un corte a mitad de una onda suena como un "clic".
+    if (fadeMs > 0) {
+      const f = Math.min(Math.floor(pcm.length / 2), Math.round((fadeMs / 1000) * SAMPLE_RATE));
+      for (let i = 0; i < f; i++) { const g = i / f; pcm[i] *= g; pcm[pcm.length - 1 - i] *= g; }
+    }
     let peak = 0, sumsq = 0;
     for (let i = 0; i < pcm.length; i++) { const a = Math.abs(pcm[i]); if (a > peak) peak = a; sumsq += pcm[i] * pcm[i]; }
     const rms = Math.sqrt(sumsq / pcm.length);
@@ -612,15 +786,49 @@
   // ---------------------------------------------------------------- API pública
   // Paso 1: captura el tramo una sola vez y estima cuánto pesaría cada combinación de
   // resolución y fps. Los cuadros quedan en memoria para crear el sticker sin recapturar.
-  async function analyze({ file, start = 0, duration, mode = "ajustar", onProgress, signal }) {
+  //
+  // Fuentes:
+  // - visual: { kind: "video" | "gif" | "image", file, start, dur }  (un GIF se usa completo: start 0)
+  // - audio:  { file, start, dur }  (puede ser otro archivo; por defecto, el mismo video y tramo)
+  // - fit, cuando la imagen y el audio duran distinto:
+  //   "repetir"       el sticker dura lo que el audio y la animación se repite;
+  //   "congelar"      el sticker dura lo que el audio y queda en el último cuadro;
+  //   "independiente" cada uno conserva su duración (WhatsApp no exige que coincidan).
+  // Si la animación es más larga que el audio, con "repetir"/"congelar" se corta al largo del audio.
+  // Una imagen fija siempre dura lo que el audio.
+  async function analyze({ file, start = 0, duration, mode = "ajustar", visual, audio, fit = "repetir", onProgress, signal }) {
+    if (!visual) visual = { kind: "video", file, start, dur: duration };
+    if (!audio) audio = { file: visual.file, start: visual.start, dur: visual.dur };
     const prog = onProgress || (() => {});
     const t0 = performance.now();
-    const dur = duration;
+    const vDur = visual.kind === "image" ? audio.dur : visual.dur;
+    const dur = visual.kind === "image" || fit !== "independiente" ? audio.dur : vDur; // duración del sticker
+    const capDur = Math.min(vDur, dur);                                                // lo que se captura
+    const base = { file: visual.file, start: visual.start || 0, visual, audio, fit, dur, vDur, mode };
+
+    if (visual.kind === "image") {
+      // Un solo cuadro que dura todo el audio: no hay combinaciones de fps que elegir.
+      log("info", "analizar:parametros", { tipo: "imagen", archivo: visual.file.name, bytes: visual.file.size, duracionAudio: audio.dur, modo: mode });
+      prog("Leyendo la imagen…", 0.3);
+      const f = await captureImage(visual.file, SIDE, mode);
+      const cells = SIDES.map((side) => ({ side, fps: 1, estado: "ok", score: side }));
+      const an = { ...base, frames: [f], captureFps: 1, captureSide: SIDE, distinct: { 1: 1 }, cells, auto: cells[0], ms: Math.round(performance.now() - t0) };
+      prog("Imagen lista", 1);
+      return an;
+    }
+
     const captureFps = captureFpsFor(dur);
-    const slots = Math.ceil(dur * captureFps);
+    const slots = Math.ceil(capDur * captureFps);
     const captureSide = Math.max(64, Math.min(SIDE, Math.floor(Math.sqrt(CAPTURE_MEM_BYTES / (4 * slots)))));
-    log("info", "analizar:parametros", { archivo: file.name, bytes: file.size, inicio: start, duracion: dur, modo: mode, captureFps, captureSide });
-    const frames = await captureFrames(file, start, dur, captureFps, captureSide, mode, (t, f) => prog(t, f * 0.8), signal);
+    log("info", "analizar:parametros", {
+      tipo: visual.kind, archivo: visual.file.name, bytes: visual.file.size, inicio: visual.start || 0, duracionImagen: vDur,
+      audioAparte: audio.file !== visual.file, duracionAudio: audio.dur, ajuste: fit, duracionSticker: dur, modo: mode, captureFps, captureSide,
+    });
+    const capProg = (t, f) => prog(t, f * 0.8);
+    const captured = visual.kind === "gif"
+      ? await captureAnimation(visual.file, capDur, captureFps, captureSide, mode, capProg, signal)
+      : await captureFrames(visual.file, visual.start || 0, capDur, captureFps, captureSide, mode, capProg, signal);
+    const frames = fitTimeline(captured, capDur, dur, captureFps, fit);
     const sides = SIDES.filter((x) => x <= captureSide);
     const fpsList = FPS_LIST.filter((x) => x <= captureFps);
     // Cuadros distintos para cada fps (los repetidos se fusionan y casi no pesan).
@@ -666,7 +874,7 @@
     }
     const pick = (st) => cells.filter((c) => c.estado === st).sort((x, y) => y.score - x.score)[0];
     const auto = pick("ok") || pick("baja") || null;
-    const an = { file, start, dur, mode, frames, captureFps, captureSide, sampleBytes, distinct, cells, auto, ms: Math.round(performance.now() - t0) };
+    const an = { ...base, frames, captureFps, captureSide, sampleBytes, distinct, cells, auto, ms: Math.round(performance.now() - t0) };
     log("info", "analizar:resultado", {
       ms: an.ms, captureFps, captureSide, distintos: distinct, muestra: M,
       auto: auto && { side: auto.side, fps: auto.fps, est: auto.est, estado: auto.estado },
@@ -683,20 +891,27 @@
   }
 
   // Paso 2: codifica el audio y el sticker con la combinación elegida.
-  async function create(an, { side, fps, syncMs = 0, onProgress, signal, packName = "", publisher = "" }) {
+  async function create(an, { side, fps, syncMs = 0, still = false, audio = null, onProgress, signal, packName = "", publisher = "" }) {
     if (!an || !an.frames) throw new Error("Primero calcula las opciones del tramo");
     syncMs = Math.max(0, Math.min(1000, Math.round(+syncMs || 0)));
+    still = !!still && an.visual.kind === "image";
     const prog = onProgress || (() => {});
     const t0 = performance.now();
-    const { file, start, dur } = an;
+    const { dur } = an;
+    // El audio puede cambiar después del análisis sin recalcular: con "independiente" no afecta a los cuadros.
+    const A = audio || an.audio;
+    if (an.visual.kind === "image" || an.fit !== "independiente") {
+      if (Math.abs(A.dur - an.audio.dur) > 0.002) throw new Error("La duración del audio cambió: vuelve a calcular las opciones");
+    }
     const cell = an.cells.find((c) => c.side === side && c.fps === fps);
-    log("info", "crear:parametros", { side, fps, compensacionMs: syncMs, estimado: cell && cell.est, estado: cell && cell.estado });
+    log("info", "crear:parametros", { side, fps, compensacionMs: syncMs, estatico: still, estimado: cell && cell.est, estado: cell && cell.estado });
 
     // Audio: la tasa de bits baja en clips largos para no pasar de 1 MB (límite de WhatsApp).
-    const bitrate = Math.max(12000, Math.min(32000, Math.floor((0.9 * MAX_AUDIO_BYTES * 8) / dur)));
-    if ((bitrate / 8) * dur > 0.97 * MAX_AUDIO_BYTES) throw new Error(`Con ${Math.round(dur)} s el audio no cabe en 1 MB (límite de WhatsApp). Máximo unos ${Math.floor((0.9 * MAX_AUDIO_BYTES * 8) / 12000 / 60)} minutos.`);
+    const bitrate = Math.max(12000, Math.min(32000, Math.floor((0.9 * MAX_AUDIO_BYTES * 8) / A.dur)));
+    if ((bitrate / 8) * A.dur > 0.97 * MAX_AUDIO_BYTES) throw new Error(`Con ${Math.round(A.dur)} s el audio no cabe en 1 MB (límite de WhatsApp). Máximo unos ${Math.floor((0.9 * MAX_AUDIO_BYTES * 8) / 12000 / 60)} minutos.`);
     prog("Extrayendo audio…", 0);
-    const pcm = await extractAudio(file, start, dur);
+    // Un audio aparte se corta donde el usuario quiera: se suaviza el corte para evitar clics.
+    const pcm = await extractAudio(A.file, A.start, A.dur, A.file !== an.visual.file ? 8 : 0);
     checkAbort(signal);
     prog("Codificando audio…", 0.05);
     const { packets, preSkip, config } = await encodeOpus(pcm, bitrate);
@@ -708,10 +923,11 @@
     if (!oggCheck.ok) throw new Error("El audio generado no se puede reproducir: " + oggCheck.error);
 
     const exifMeta = await stickerMeta({ packName, publisher, soundSha });
-    const w = await encodeWebp(an, side, fps, exifMeta, { onProgress: prog, signal, syncMs });
+    const w = await encodeWebp(an, side, fps, exifMeta, { onProgress: prog, signal, syncMs, still });
     const info = {
-      duracion: dur, segundosAudio: Math.max(1, Math.round(dur)),
-      fps: w.fps, calidad: w.q, lado: w.side, cuadros: w.frames, isAnimated: true,
+      tipo: an.visual.kind, ajuste: an.fit,
+      duracion: dur, duracionAudio: A.dur, segundosAudio: Math.max(1, Math.round(A.dur)),
+      fps: an.visual.kind === "image" ? null : w.fps, calidad: w.q, lado: w.side, cuadros: w.frames, isAnimated: !still,
       compensacionMs: syncMs, webpBytes: w.bytes.length, estimado: cell && cell.est,
       oggBytes: ogg.length, audioKbps: Math.round(bitrate / 1000), soundSha256: soundSha, paquete: exifMeta["sticker-pack-name"] || "", autor: exifMeta["sticker-pack-publisher"] || "",
       msTotal: Math.round(performance.now() - t0),
@@ -722,8 +938,8 @@
   }
 
   // Atajo (pruebas): analizar + elegir (automático o fijo) + crear.
-  async function convert({ file, start = 0, duration, mode = "ajustar", syncMs = 0, side = "auto", fps = "auto", onProgress, signal }) {
-    const an = await analyze({ file, start, duration, mode, onProgress, signal });
+  async function convert({ file, start = 0, duration, mode = "ajustar", visual, audio, fit, still = false, syncMs = 0, side = "auto", fps = "auto", onProgress, signal }) {
+    const an = await analyze({ file, start, duration, mode, visual, audio, fit, onProgress, signal });
     try {
       let c = an.auto;
       if (side !== "auto" || fps !== "auto") {
@@ -731,7 +947,7 @@
         c = ok.sort((x, y) => y.score - x.score)[0];
       }
       if (!c) throw new Error("Ninguna combinación cabe en 1 MB para este tramo");
-      const r = await create(an, { side: c.side, fps: c.fps, syncMs, onProgress, signal });
+      const r = await create(an, { side: c.side, fps: c.fps, syncMs, still, onProgress, signal });
       r.analysis = { auto: an.auto, cells: an.cells, ms: an.ms, captureFps: an.captureFps, captureSide: an.captureSide };
       return r;
     } finally {
@@ -756,11 +972,15 @@
 
   WAAS.convert = convert;
   WAAS.probeVideo = probeVideo;
+  WAAS.probeAudio = probeAudio;
+  WAAS.probeImage = probeImage;
+  WAAS.probeAnimation = probeAnimation;
+  WAAS.isAnimationFile = isAnimationFile;
   WAAS.capabilities = capabilities;
   WAAS.analyze = analyze;
   WAAS.retagWebp = retagWebp;
   WAAS.create = create;
   WAAS.release = release;
   WAAS.limits = { SIDE, MAX_STICKER_BYTES, MAX_AUDIO_BYTES, SIDES, FPS_LIST };
-  WAAS._internals = { buildOggOpus, buildAnimatedWebp, exifWhatsApp, readChunks, plan, sha256b64, score };
+  WAAS._internals = { buildOggOpus, buildAnimatedWebp, buildStillWebp, fitTimeline, exifWhatsApp, readChunks, plan, sha256b64, score };
 })();

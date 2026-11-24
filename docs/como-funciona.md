@@ -54,6 +54,8 @@ Message {
   - `sound-sha256`
 - El servidor de WhatsApp rechaza stickers de más de ~1 MB (HTTP 413).
 - La guía oficial de packs de stickers exige que cada cuadro dure al menos 8 ms.
+- **Duración:** WhatsApp no exige que el audio y la animación duren lo mismo; no lo comprueba al enviar ni al recibir. Al tocar el sticker, WhatsApp Web reproduce la animación una vez y el audio una vez, cada uno por su lado. En los stickers reales observados ambos duran lo mismo. Con duraciones distintas, en la prueba en el celular WhatsApp repitió el audio en bucle; no hay forma de controlarlo desde el sticker.
+- Todos los stickers con sonido reales observados son animados. Un sticker fijo con sonido es válido para el protocolo, pero no está comprobado que los clientes lo reproduzcan.
 
 ## 5. Opciones de la cuenta
 
@@ -67,6 +69,11 @@ Si la creación no está activa, WhatsApp Web descarta el audio al enviar. La ex
 
 ## 6. Qué hace la extensión
 
+0. **Fuentes:** la imagen puede ser un video (`<video>`), un GIF, WebP animado o APNG (`ImageDecoder` de WebCodecs) o una imagen fija. El audio puede venir del mismo video o de otro archivo de audio o video, con su propio tramo.
+   - Por defecto la animación y el audio conservan cada uno su duración. Opcionalmente, si la animación dura menos que el audio, se repite o se queda en su último cuadro (y si dura más, se corta al largo del audio).
+   - El análisis solo depende de la animación: el audio se sube como archivo aparte y no suma al peso del sticker. Por eso cambiar el tramo de audio no obliga a recalcular, salvo cuando la animación se ajusta a su duración.
+   - Una imagen fija se envía como WebP animado de un solo cuadro que dura lo que el audio (o, como prueba, como WebP fijo).
+   - Al cortar un audio aparte se aplica un fundido de 8 ms en los bordes para evitar clics.
 1. **Recorte:** el visor cuenta el tiempo desde el primer cuadro real. Algunos videos recortados tienen marcas de tiempo que empiezan, por ejemplo, en 130 s.
 2. **Análisis** (`analyze`):
    - Captura el tramo una vez, cuadro por cuadro, tomando cada cuadro en la mitad de su intervalo. Si se toma justo en el borde, el navegador a veces devuelve el cuadro anterior.

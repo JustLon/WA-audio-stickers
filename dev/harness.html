@@ -11,16 +11,39 @@
     for (let i = 0; i < b.length; i += CH) s += String.fromCharCode.apply(null, b.subarray(i, i + CH));
     return btoa(s);
   }
-  window.testConvert = async function (url, opts) {
-    const r = await fetch(url);
-    const blob = await r.blob();
-    const name = decodeURIComponent(url.split("/").pop());
-    const file = new File([blob], name, { type: blob.type || "video/mp4" });
-    const meta = await WAAS.probeVideo(file);
-    const duration = Math.min(opts.maxDur || 10, meta.duration - (opts.start || 0));
+  async function fileFrom(url, fallbackType) {
+    const blob = await (await fetch(url)).blob();
+    return new File([blob], decodeURIComponent(url.split("/").pop()), { type: blob.type || fallbackType });
+  }
+
+  // opts: start, maxDur, mode, fps, side, syncMs y, para las pestañas nuevas:
+  //   kind ("video" | "gif" | "image"), audioUrl, audioStart, audioDur, fit, still.
+  window.testConvert = async function (url, opts = {}) {
+    const kind = opts.kind || "video";
+    const file = await fileFrom(url, kind === "video" ? "video/mp4" : "image/gif");
+    let meta, visual, audio;
+    if (kind === "image") {
+      meta = await WAAS.probeImage(file);
+      visual = { kind, file };
+    } else if (kind === "gif") {
+      meta = await WAAS.probeAnimation(file);
+      visual = { kind, file, start: 0, dur: meta.duration };
+    } else {
+      meta = await WAAS.probeVideo(file);
+      const start = opts.start || 0;
+      visual = { kind, file, start, dur: Math.min(opts.maxDur || 10, meta.duration - start) };
+    }
+    if (opts.audioUrl) {
+      const af = await fileFrom(opts.audioUrl, "audio/mpeg");
+      const a = await WAAS.probeAudio(af);
+      const start = opts.audioStart || 0;
+      audio = { file: af, start, dur: Math.min(opts.audioDur || 10, a.duration - start) };
+    } else {
+      audio = { file, start: visual.start, dur: visual.dur };
+    }
     const t0 = performance.now();
     try {
-      const res = await WAAS.convert({ file, start: opts.start || 0, duration, mode: opts.mode || "ajustar", fps: opts.fps || "auto", side: opts.side || "auto", maxBytes: opts.maxBytes || 700000 });
+      const res = await WAAS.convert({ visual, audio, fit: opts.fit || "repetir", still: !!opts.still, syncMs: opts.syncMs || 0, mode: opts.mode || "ajustar", fps: opts.fps || "auto", side: opts.side || "auto" });
       const cap = WAAS.entries.filter(e => e.event === "video:cuadros").slice(-1).map(e => e.data.metodo + "/" + e.data.fpsCaptura + "fps/" + e.data.ladoCaptura + "px/" + e.data.ms + "ms")[0];
       return { ok: true, meta, cap, info: res.info, ms: Math.round(performance.now() - t0), webp: await toB64(res.webp), ogg: await toB64(res.ogg) };
     } catch (e) {

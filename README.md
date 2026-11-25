@@ -1,12 +1,14 @@
 <p align="center"><img src="extension/icons/icono-128.png" width="96" alt=""></p>
 
-# Stickers con sonido
+<h1 align="center">Stickers con sonido</h1>
 
-Extensión para Chrome, Edge o Brave que convierte un video, una imagen o un GIF en un **sticker con sonido** y lo envía desde **WhatsApp Web**. Todo se procesa en tu navegador: nada se sube a otro servidor que no sea WhatsApp.
+<p align="center">Convierte un video, una imagen o un GIF en un <b>sticker con sonido</b> y envíalo desde <b>WhatsApp Web</b>.<br>Todo se procesa en tu navegador: nada se sube a otro servidor que no sea WhatsApp.</p>
 
-<p align="center"><a href="https://github.com/Shirtep/WA-audio-stickers/releases/latest/download/stickers-con-sonido.zip"><b>⬇ Descargar Stickers con sonido (ZIP)</b></a> · <a href="#instalación">Cómo instalarla</a></p>
+<p align="center"><a href="https://github.com/Shirtep/WA-audio-stickers/releases/latest/download/stickers-con-sonido.zip"><img src="docs/img/boton-descargar.png" width="352" alt="Descargar gratis (ZIP para Chrome, Edge o Brave)"></a></p>
 
-Es gratis y siempre lo será. Si quieres apoyar el proyecto: [☕ ko-fi.com/shirtep](https://ko-fi.com/shirtep).
+<p align="center"><a href="#instalación"><img src="docs/img/boton-guia.png" width="282" alt="Guía de instalación"></a> <a href="https://ko-fi.com/shirtep"><img src="docs/img/boton-apoyar.png" width="282" alt="Apoyar en Ko-fi"></a></p>
+
+<p align="center"><sub>Gratis y sin fines de lucro. Las donaciones son voluntarias.</sub></p>
 
 > **Aviso:** proyecto personal, **no oficial**, sin relación con WhatsApp ni con Meta. Usa funciones internas de WhatsApp Web que pueden cambiar en cualquier momento, y activa en tu navegador la función de stickers con sonido, que WhatsApp está probando. Úsalo bajo tu propia responsabilidad.
 

@@ -20,6 +20,7 @@
   header { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
   h2 { margin: 0; font-size: 19px; }
   .muted { color: var(--muted); font-size: 12px; }
+  .muted a { color: inherit; }
   .note { color: var(--warn); font-size: 12.5px; }
   .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin: 6px 0 4px; }
   .tabs button { border: none; background: none; color: var(--muted); padding: 8px 12px; font-size: 13.5px; font-weight: 600; border-bottom: 3px solid transparent; margin-bottom: -1px; }
@@ -937,7 +938,8 @@
 
     const closeBtn = h("button", { class: "close", title: "Cerrar", textContent: "×" });
     const panel = h("div", { class: "panel" },
-      h("header", null, h("div", null, h("h2", null, "Stickers con sonido"), h("div", { class: "muted" }, "Versión " + WAAS.VERSION + " · todo se procesa en tu navegador · máximo 1 MB por sticker")), closeBtn),
+      h("header", null, h("div", null, h("h2", null, "Stickers con sonido"), h("div", { class: "muted" }, "Versión " + WAAS.VERSION + " · todo se procesa en tu navegador · máximo 1 MB por sticker · ",
+        h("a", { href: "https://ko-fi.com/shirtep", target: "_blank", rel: "noopener", textContent: "☕ Apoyar" }))), closeBtn),
       h("nav", { class: "tabs" }, tabBtns),
       G.forms.map((f) => f.el), tools);
     const overlay = h("div", { class: "overlay", style: "display:none" }, panel);

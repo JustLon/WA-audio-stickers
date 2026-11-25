@@ -4,13 +4,17 @@
 
 Extensión para Chrome, Edge o Brave que convierte un video, una imagen o un GIF en un **sticker con sonido** y lo envía desde **WhatsApp Web**. Todo se procesa en tu navegador: nada se sube a otro servidor que no sea WhatsApp.
 
+<p align="center"><a href="https://github.com/Shirtep/WA-audio-stickers/releases/latest/download/stickers-con-sonido.zip"><b>⬇ Descargar Stickers con sonido (ZIP)</b></a> · <a href="#instalación">Cómo instalarla</a></p>
+
+Es gratis y siempre lo será. Si quieres apoyar el proyecto: [☕ ko-fi.com/shirtep](https://ko-fi.com/shirtep).
+
 > **Aviso:** proyecto personal, **no oficial**, sin relación con WhatsApp ni con Meta. Usa funciones internas de WhatsApp Web que pueden cambiar en cualquier momento, y activa en tu navegador la función de stickers con sonido, que WhatsApp está probando. Úsalo bajo tu propia responsabilidad.
 
 ## Instalación
 
 No hay que ejecutar ningún programa: se carga la carpeta de la extensión en el navegador (Chrome, Edge o Brave de escritorio).
 
-1. Descarga **`stickers-con-sonido-X.Y.Z.zip`** desde la [última versión](https://github.com/Shirtep/WA-audio-stickers/releases/latest).
+1. Descarga el [**ZIP de la última versión**](https://github.com/Shirtep/WA-audio-stickers/releases/latest/download/stickers-con-sonido.zip) (también está en la página de [versiones](https://github.com/Shirtep/WA-audio-stickers/releases/latest)).
 2. Descomprímelo en un lugar donde se vaya a quedar, por ejemplo `Documentos`. Obtendrás una carpeta `stickers-con-sonido`.
    **No la borres ni la muevas después:** el navegador carga la extensión desde ahí.
 3. Abre la página de extensiones: escribe `chrome://extensions` en la barra de direcciones (en Edge, `edge://extensions`).
@@ -80,3 +84,7 @@ Quien recibe el sticker necesita una versión de WhatsApp que ya reproduzca stic
 
 - [`docs/como-funciona.md`](docs/como-funciona.md): cómo se arma un sticker con sonido (protobuf, formato del audio, límites) y cómo trabaja la extensión.
 - [`dev/`](dev/): páginas para probar la conversión sin WhatsApp y el video de calibración de sincronía.
+
+## Licencia
+
+Uso libre y gratuito, **sin fines comerciales**: puedes usarla, estudiarla, modificarla y compartirla, pero no venderla ni usarla para lucrar. Texto completo en [`LICENSE.md`](LICENSE.md) ([PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0)). Se ofrece tal cual, sin garantías.

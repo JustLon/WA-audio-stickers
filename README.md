@@ -14,7 +14,7 @@
 
 ## Instalación
 
-No hay que ejecutar ningún programa: se carga la carpeta de la extensión en el navegador (Chrome, Edge o Brave de escritorio).
+No hay que ejecutar ningún programa: se carga la carpeta de la extensión en el navegador (Chrome, Edge o Brave de escritorio). **No funciona en Firefox** ni en navegadores basados en él (ver [Requisitos](#requisitos)).
 
 1. Descarga el [**ZIP de la última versión**](https://github.com/Shirtep/WA-audio-stickers/releases/latest/download/stickers-con-sonido.zip) (también está en la página de [versiones](https://github.com/Shirtep/WA-audio-stickers/releases/latest)).
 2. Descomprímelo en un lugar donde se vaya a quedar, por ejemplo `Documentos`. Obtendrás una carpeta `stickers-con-sonido`.
@@ -70,7 +70,7 @@ Las capturas son de Brave. En Chrome y Edge se ve igual, con otros colores.
 
 Cuanto más largo es el tramo, menos resolución o fps caben en 1 MB: la tabla del paso 3 muestra qué cabe antes de crear nada.
 
-Quien recibe el sticker necesita una versión de WhatsApp que ya reproduzca stickers con sonido. Si no la tiene, verá un sticker normal, sin sonido.
+Quien recibe el sticker necesita una versión de WhatsApp que ya reproduzca stickers con sonido. Si no la tiene, en lugar del sticker verá el aviso *«Recibiste un mensaje que no es compatible con tu versión de WhatsApp»* y tendrá que actualizar WhatsApp para verlo.
 
 ## Privacidad
 
@@ -79,8 +79,46 @@ Quien recibe el sticker necesita una versión de WhatsApp que ya reproduzca stic
 
 ## Requisitos
 
-- Chrome, Edge o Brave de escritorio, actualizado (usa WebCodecs para codificar el audio).
+- Chrome, Edge o Brave de escritorio, actualizado (usa WebCodecs para codificar el audio). Otros navegadores basados en Chromium, como Opera o Vivaldi, probablemente funcionen, pero no están probados.
 - Una cuenta de WhatsApp abierta en WhatsApp Web.
+
+**No funciona en Firefox** ni en los navegadores basados en él (LibreWolf, Waterfox, Floorp, Zen, Tor Browser…): usan otro sistema de extensiones y no pueden cargarla. Tampoco funciona en Safari ni en navegadores de celular.
+
+## ¿No te funciona?
+
+Revisa esto antes de reportarlo; resuelve la mayoría de los casos:
+
+1. **Al cargarla, el navegador dice que falta el manifiesto (`manifest.json`):** elegiste la carpeta equivocada. Algunos descompresores crean una carpeta dentro de otra: elige la que contiene directamente `manifest.json`.
+2. **La extensión aparece con error o desapareció:** moviste o borraste la carpeta después de instalarla. Vuelve a ponerla donde estaba, o quítala y cárgala de nuevo.
+3. **Pulsas el icono y no pasa nada:** recarga la pestaña de WhatsApp Web (F5). Las pestañas abiertas antes de instalar o actualizar la extensión no la tienen.
+4. **El navegador está desactualizado:** actualízalo (en Chrome: menú ⋮ → Ayuda → Información de Google Chrome) y vuelve a probar.
+5. **Quien lo recibe ve «Recibiste un mensaje que no es compatible con tu versión de WhatsApp»:** el sticker se envió bien, pero su WhatsApp todavía no reproduce stickers con sonido. Tiene que actualizar WhatsApp desde la tienda de su celular. No es un problema de la extensión.
+6. **Tienes una versión antigua de la extensión:** [descarga la última](https://github.com/Shirtep/WA-audio-stickers/releases/latest/download/stickers-con-sonido.zip) y actualiza (ver *Actualizar* en la instalación).
+
+Si nada de esto lo resuelve, puede ser que tu WhatsApp Web sea distinto: WhatsApp no le da a todos la misma versión al mismo tiempo, y la extensión usa partes internas que pueden cambiar. En ese caso, repórtalo como se explica abajo, con el registro de diagnóstico.
+
+## Reportar un problema o sugerir algo
+
+Los reportes y sugerencias se reciben en [**Issues**](https://github.com/Shirtep/WA-audio-stickers/issues/new/choose). Necesitas una cuenta de GitHub (es gratis). Pulsa **New issue** y elige:
+
+- **Problema:** algo falla al instalarla o al usarla.
+- **Sugerencia:** una idea o mejora.
+
+Antes, busca en los [issues existentes](https://github.com/Shirtep/WA-audio-stickers/issues?q=is%3Aissue) por si alguien ya lo reportó: si es así, comenta ahí en vez de abrir otro.
+
+Para un **problema**, incluye:
+
+- Tu navegador y su versión, y tu sistema (Windows, macOS, Linux).
+- La versión de la extensión (aparece arriba del panel).
+- Qué hiciste, qué esperabas y qué pasó. Una captura ayuda mucho; tapa los chats y números que aparezcan.
+- **El registro de diagnóstico**, si el problema es al usarla:
+  1. Abre el panel, despliega **Herramientas de prueba** al final y pulsa **Diagnóstico**.
+  2. Repite lo que falló.
+  3. Pulsa **Guardar registro…** y adjunta el archivo `.json` al issue (arrástralo al cuadro de texto). Si GitHub no lo acepta, comprímelo en un ZIP.
+
+  El registro oculta los números de teléfono y no incluye mensajes ni claves, pero sí los nombres de los archivos que elegiste y el nombre del chat al que enviaste el sticker. Ábrelo con un editor de texto y borra o cambia lo que no quieras compartir antes de adjuntarlo.
+
+Si el problema es al instalarla, no hace falta el registro: basta con una captura del mensaje de error de la página de extensiones.
 
 ## Para desarrolladores
 

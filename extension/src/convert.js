@@ -31,12 +31,40 @@
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const te = new TextEncoder();
+  const ENCODE_CONCURRENCY = Math.max(2, Math.min(8, (typeof navigator !== "undefined" && navigator.hardwareConcurrency) || 4));
 
   function checkAbort(signal) {
     if (signal && signal.aborted) throw new DOMException("Cancelado por el usuario", "AbortError");
   }
 
+  function createCanvasPool(side, count = ENCODE_CONCURRENCY) {
+    return Array.from({ length: Math.max(1, count) }, () => {
+      const canvas = new OffscreenCanvas(side, side);
+      return { canvas, ctx: canvas.getContext("2d") };
+    });
+  }
+
+  async function runPool(items, pool, fn, signal) {
+    const n = items.length;
+    if (!n) return [];
+    const results = new Array(n);
+    let next = 0;
+    const workers = Math.min(pool.length, n);
+    await Promise.all(Array.from({ length: workers }, async (_, w) => {
+      const slot = pool[w];
+      while (true) {
+        checkAbort(signal);
+        const idx = next++;
+        if (idx >= n) break;
+        results[idx] = await fn(items[idx], idx, slot);
+      }
+    }));
+    return results;
+  }
+
   // ---------------------------------------------------------------- video
+  const videoMetaCache = new WeakMap(); // File -> { duration, offset, width, height }
+
   function loadVideo(file) {
     return new Promise((resolve, reject) => {
       const v = document.createElement("video");
@@ -47,6 +75,12 @@
       const timer = setTimeout(() => reject(new Error("Tiempo agotado cargando el video")), 30000);
       v.onloadeddata = async () => {
         clearTimeout(timer);
+        const cached = videoMetaCache.get(file);
+        if (cached) {
+          v._waasOffset = cached.offset;
+          resolve(v);
+          return;
+        }
         // Algunos videos recortados conservan marcas de tiempo que no empiezan en 0
         // (p. ej. empiezan en 130 s). Chrome se posiciona en el primer cuadro: ese es el desfase.
         v._waasOffset = Number.isFinite(v.currentTime) ? v.currentTime : 0;
@@ -69,6 +103,7 @@
         }
         await seekWait(v._waasOffset);
         if (v.duration !== initialDuration) log("info", "video:duracion-corregida", { inicial: initialDuration, final: v.duration, desfase: v._waasOffset });
+        videoMetaCache.set(file, { duration: v.duration - v._waasOffset, offset: v._waasOffset, width: v.videoWidth, height: v.videoHeight });
         resolve(v);
       };
       v.onerror = () => {
@@ -91,38 +126,59 @@
     });
   }
 
-  // Dimensiones de cualquier fuente dibujable: <video>, VideoFrame (GIF) o ImageBitmap (imagen).
+  // Dimensiones de cualquier fuente dibujable: <video>, VideoFrame (GIF/WebCodecs) o ImageBitmap (imagen).
   const srcW = (s) => s.videoWidth || s.displayWidth || s.width;
   const srcH = (s) => s.videoHeight || s.displayHeight || s.height;
 
-  function drawFrame(ctx, v, mode, side) {
-    const vw = srcW(v), vh = srcH(v);
+  function drawFrame(ctx, v, mode, side, rotation = 0) {
+    const rw = srcW(v), rh = srcH(v);
+    const swap = rotation === 90 || rotation === 270;
+    const vw = swap ? rh : rw, vh = swap ? rw : rh;
     ctx.clearRect(0, 0, side, side);
     const s = mode === "recortar" ? Math.max(side / vw, side / vh) : Math.min(side / vw, side / vh);
-    const w = vw * s, h = vh * s;
-    ctx.drawImage(v, (side - w) / 2, (side - h) / 2, w, h);
+    if (!rotation) {
+      const w = vw * s, h = vh * s;
+      ctx.drawImage(v, (side - w) / 2, (side - h) / 2, w, h);
+    } else {
+      const dw = rw * s, dh = rh * s;
+      ctx.save();
+      ctx.translate(side / 2, side / 2);
+      ctx.rotate((rotation * Math.PI) / 180);
+      ctx.drawImage(v, -dw / 2, -dh / 2, dw, dh);
+      ctx.restore();
+    }
   }
 
   async function probeVideo(file) {
+    if (videoMetaCache.has(file)) return videoMetaCache.get(file);
     const v = await loadVideo(file);
     try {
       const offset = v._waasOffset || 0;
-      return { duration: v.duration - offset, offset, width: v.videoWidth, height: v.videoHeight };
+      const meta = { duration: v.duration - offset, offset, width: v.videoWidth, height: v.videoHeight };
+      videoMetaCache.set(file, meta);
+      return meta;
     } finally {
       URL.revokeObjectURL(v._waasUrl);
     }
   }
 
-  function makeSnapper(side, mode) {
+  const FP_SIDE = 16;
+  function makeSnapper(side, mode, rotation = 0) {
     const canvas = new OffscreenCanvas(side, side);
     const ctx = canvas.getContext("2d");
-    const fpCanvas = new OffscreenCanvas(32, 32);
+    const fpCanvas = new OffscreenCanvas(FP_SIDE, FP_SIDE);
     const fpCtx = fpCanvas.getContext("2d", { willReadFrequently: true });
+    const canTransfer = typeof canvas.transferToImageBitmap === "function";
     return (v) => {
-      drawFrame(ctx, v, mode, side);
-      fpCtx.clearRect(0, 0, 32, 32);
-      fpCtx.drawImage(canvas, 0, 0, 32, 32);
-      const fp = fpCtx.getImageData(0, 0, 32, 32).data;
+      drawFrame(ctx, v, mode, side, rotation);
+      fpCtx.clearRect(0, 0, FP_SIDE, FP_SIDE);
+      fpCtx.drawImage(canvas, 0, 0, FP_SIDE, FP_SIDE);
+      const raw = fpCtx.getImageData(0, 0, FP_SIDE, FP_SIDE).data;
+      const fp = new Uint32Array(raw.buffer, raw.byteOffset, raw.byteLength >>> 2);
+      if (canTransfer) {
+        const bmp = canvas.transferToImageBitmap();
+        return { bmp, bmpPromise: Promise.resolve(bmp), fp, used: false };
+      }
       return { bmpPromise: createImageBitmap(canvas), fp, used: false };
     };
   }
@@ -202,47 +258,474 @@
     return { slots, presented: n };
   }
 
-  // Por defecto se salta cuadro por cuadro: es más lento pero exacto (cada instante recibe su cuadro).
-  // La reproducción queda como respaldo si un salto se atasca.
-  async function captureFrames(file, start, dur, fps, side, mode, onProgress, signal, method = "saltos") {
-    const t0 = performance.now();
-    let v = await loadVideo(file);
-    try {
-      if (!v.videoWidth || !v.videoHeight) throw new Error("El video no tiene imagen (¿es solo audio?)");
-      const offset = v._waasOffset || 0;
-      const methods = method === "reproduccion" ? ["reproduccion", "saltos"] : ["saltos", "reproduccion"];
-      let res, metodo;
-      for (let i = 0; i < methods.length; i++) {
-        metodo = methods[i];
-        try {
-          res = metodo === "saltos"
-            ? await captureBySeeking(v, offset + start, dur, fps, side, mode, onProgress, signal)
-            : await captureByPlayback(v, offset + start, dur, fps, side, mode, onProgress, signal);
-          break;
-        } catch (e) {
-          if ((e && e.name === "AbortError") || i === methods.length - 1) throw e;
-          log("info", "video:captura-respaldo", { fallo: metodo, motivo: String(e && e.message || e) });
-          URL.revokeObjectURL(v._waasUrl);
-          v = await loadVideo(file);
+  // ---------------------------------------------------------------- WebCodecs + demuxer MP4 ligero
+  // Decodifica la pista de video de un MP4/MOV secuencialmente con VideoDecoder (sin hacer seek
+  // cuadro por cuadro). Solo lee la caja moov y el tramo exacto de mdat necesario.
+  function mp4Tag(u8, off) {
+    return String.fromCharCode(u8[off], u8[off + 1], u8[off + 2], u8[off + 3]);
+  }
+  function mp4ReadU64(dv, off) {
+    return dv.getUint32(off) * 4294967296 + dv.getUint32(off + 4);
+  }
+  function mp4ReadI64(dv, off) {
+    return dv.getInt32(off) * 4294967296 + dv.getUint32(off + 4);
+  }
+  function mp4IterBoxes(u8, dv, start, end) {
+    const boxes = [];
+    let pos = start;
+    while (pos + 8 <= end) {
+      let size = dv.getUint32(pos);
+      const type = mp4Tag(u8, pos + 4);
+      let hdr = 8;
+      if (size === 1) {
+        if (pos + 16 > end) break;
+        size = mp4ReadU64(dv, pos + 8);
+        hdr = 16;
+      } else if (size === 0) {
+        size = end - pos;
+      }
+      if (size < hdr || pos + size > end) break;
+      boxes.push({ type, start: pos + hdr, end: pos + size });
+      pos += size;
+    }
+    return boxes;
+  }
+  const mp4Find = (boxes, type) => boxes.find((b) => b.type === type);
+
+  function mp4ParseCodec(u8, dv, stsd) {
+    const entryStart = stsd.start + 8;
+    if (entryStart + 86 > stsd.end) return null;
+    const entrySize = dv.getUint32(entryStart);
+    const fmt = mp4Tag(u8, entryStart + 4);
+    const width = dv.getUint16(entryStart + 32);
+    const height = dv.getUint16(entryStart + 34);
+    const subBoxes = mp4IterBoxes(u8, dv, entryStart + 86, Math.min(stsd.end, entryStart + entrySize));
+    const hex2 = (x) => x.toString(16).padStart(2, "0");
+
+    if (fmt === "avc1" || fmt === "avc3") {
+      const avcc = mp4Find(subBoxes, "avcC");
+      if (!avcc || avcc.end - avcc.start < 4) return null;
+      const desc = u8.slice(avcc.start, avcc.end);
+      const codec = `${fmt}.${hex2(desc[1])}${hex2(desc[2])}${hex2(desc[3])}`;
+      return { codec, description: desc, codedWidth: width, codedHeight: height };
+    }
+    if (fmt === "hvc1" || fmt === "hev1") {
+      const hvcc = mp4Find(subBoxes, "hvcC");
+      if (!hvcc || hvcc.end - hvcc.start < 23) return null;
+      const desc = u8.slice(hvcc.start, hvcc.end);
+      const space = ["", "A", "B", "C"][(desc[1] >> 6) & 3] || "";
+      const tier = (desc[1] & 0x20) ? "H" : "L";
+      const profileIdc = desc[1] & 0x1f;
+      let compat = 0;
+      for (let i = 0; i < 4; i++) {
+        let b = desc[2 + i], rev = 0;
+        for (let k = 0; k < 8; k++) rev = (rev << 1) | ((b >> k) & 1);
+        compat = (compat * 256) + rev;
+      }
+      const level = desc[12];
+      const codec = `${fmt}.${space}${profileIdc}.${compat.toString(16).toUpperCase()}.${tier}${level}`;
+      return { codec, description: desc, codedWidth: width, codedHeight: height };
+    }
+    if (fmt === "vp09") {
+      const vpcc = mp4Find(subBoxes, "vpcC");
+      if (!vpcc || vpcc.end - vpcc.start < 8) return null;
+      const p = vpcc.start + 4; // fullbox header
+      const profile = String(u8[p]).padStart(2, "0");
+      const level = String(u8[p + 1]).padStart(2, "0");
+      const depth = String(u8[p + 2] >> 4).padStart(2, "0");
+      return { codec: `vp09.${profile}.${level}.${depth}`, codedWidth: width, codedHeight: height };
+    }
+    if (fmt === "av01") {
+      const av1c = mp4Find(subBoxes, "av1C");
+      if (!av1c || av1c.end - av1c.start < 4) return null;
+      const p = av1c.start;
+      const profile = (u8[p + 1] >> 5) & 7;
+      const level = String(u8[p + 1] & 0x1f).padStart(2, "0");
+      const tier = (u8[p + 2] & 0x80) ? "H" : "M";
+      const highBit = (u8[p + 2] & 0x40) ? 1 : 0;
+      const twelve = (u8[p + 2] & 0x20) ? 1 : 0;
+      const depth = highBit ? (twelve ? "12" : "10") : "08";
+      return { codec: `av01.${profile}.${level}${tier}.${depth}`, codedWidth: width, codedHeight: height };
+    }
+    return null;
+  }
+
+  function mp4Rotation(dv, tkhd) {
+    const ver = dv.getUint8(tkhd.start);
+    const matOff = tkhd.start + (ver === 1 ? 52 : 40);
+    if (matOff + 20 > tkhd.end) return 0;
+    const a = dv.getInt32(matOff) / 65536;
+    const b = dv.getInt32(matOff + 4) / 65536;
+    const deg = Math.round((Math.atan2(b, a) * 180) / Math.PI);
+    return ((deg % 360) + 360) % 360;
+  }
+
+  async function parseMp4Video(file) {
+    // Lee solo los encabezados de cajas de nivel superior para localizar ftyp y moov.
+    let pos = 0, moovRange = null, isMp4 = false;
+    while (pos + 8 <= file.size) {
+      const hdrBuf = await file.slice(pos, Math.min(file.size, pos + 16)).arrayBuffer();
+      if (hdrBuf.byteLength < 8) break;
+      const dv = new DataView(hdrBuf);
+      const u8 = new Uint8Array(hdrBuf);
+      let size = dv.getUint32(0);
+      const type = mp4Tag(u8, 4);
+      let hdr = 8;
+      if (size === 1) {
+        if (hdrBuf.byteLength < 16) break;
+        size = mp4ReadU64(dv, 8);
+        hdr = 16;
+      } else if (size === 0) {
+        size = file.size - pos;
+      }
+      if (size < hdr || pos + size > file.size) break;
+      if (type === "ftyp") isMp4 = true;
+      if (type === "moov") { moovRange = { start: pos + hdr, end: pos + size }; break; }
+      pos += size;
+    }
+    if (!isMp4 || !moovRange) return null;
+
+    const moovBuf = await file.slice(moovRange.start, moovRange.end).arrayBuffer();
+    const u8 = new Uint8Array(moovBuf);
+    const dv = new DataView(moovBuf);
+    const moovBoxes = mp4IterBoxes(u8, dv, 0, u8.length);
+    const mvhd = mp4Find(moovBoxes, "mvhd");
+    let movieTimescale = 1000;
+    if (mvhd) {
+      const ver = u8[mvhd.start];
+      movieTimescale = dv.getUint32(mvhd.start + (ver === 1 ? 20 : 12)) || 1000;
+    }
+
+    for (const trak of moovBoxes.filter((b) => b.type === "trak")) {
+      const trakBoxes = mp4IterBoxes(u8, dv, trak.start, trak.end);
+      const mdia = mp4Find(trakBoxes, "mdia");
+      if (!mdia) continue;
+      const mdiaBoxes = mp4IterBoxes(u8, dv, mdia.start, mdia.end);
+      const hdlr = mp4Find(mdiaBoxes, "hdlr");
+      if (!hdlr || mp4Tag(u8, hdlr.start + 8) !== "vide") continue;
+
+      const mdhd = mp4Find(mdiaBoxes, "mdhd");
+      const minf = mp4Find(mdiaBoxes, "minf");
+      if (!mdhd || !minf) continue;
+      const mdhdVer = u8[mdhd.start];
+      const timescale = dv.getUint32(mdhd.start + (mdhdVer === 1 ? 20 : 12));
+      if (!timescale) continue;
+
+      const minfBoxes = mp4IterBoxes(u8, dv, minf.start, minf.end);
+      const stbl = mp4Find(minfBoxes, "stbl");
+      if (!stbl) continue;
+      const stblBoxes = mp4IterBoxes(u8, dv, stbl.start, stbl.end);
+
+      const stsd = mp4Find(stblBoxes, "stsd");
+      const stts = mp4Find(stblBoxes, "stts");
+      const stsc = mp4Find(stblBoxes, "stsc");
+      const stsz = mp4Find(stblBoxes, "stsz");
+      const stco = mp4Find(stblBoxes, "stco");
+      const co64 = mp4Find(stblBoxes, "co64");
+      if (!stsd || !stts || !stsc || !stsz || (!stco && !co64)) continue;
+
+      const codecInfo = mp4ParseCodec(u8, dv, stsd);
+      if (!codecInfo) continue;
+
+      // Lista de edición (elst): compensa desfases de inicio del primer cuadro.
+      let editShiftSec = 0;
+      const edts = mp4Find(trakBoxes, "edts");
+      if (edts) {
+        const elst = mp4Find(mp4IterBoxes(u8, dv, edts.start, edts.end), "elst");
+        if (elst) {
+          const ver = u8[elst.start];
+          const count = dv.getUint32(elst.start + 4);
+          let p = elst.start + 8;
+          for (let i = 0; i < count; i++) {
+            const segDur = ver === 1 ? mp4ReadU64(dv, p) : dv.getUint32(p);
+            const mediaTime = ver === 1 ? mp4ReadI64(dv, p + 8) : dv.getInt32(p + 4);
+            p += ver === 1 ? 20 : 12;
+            if (mediaTime < 0) editShiftSec += segDur / movieTimescale;
+            else { editShiftSec -= mediaTime / timescale; break; }
+          }
         }
       }
-      // Resolver los bitmaps y deduplicar referencias.
-      const frames = [];
-      const cache = new Map();
-      for (const s of res.slots) {
-        if (!cache.has(s)) cache.set(s, { bmp: await s.bmpPromise, fp: s.fp });
-        frames.push(cache.get(s));
+
+      const tkhd = mp4Find(trakBoxes, "tkhd");
+      const rotation = tkhd ? mp4Rotation(dv, tkhd) : 0;
+
+      // Tamaños de muestra (stsz)
+      const uniformSize = dv.getUint32(stsz.start + 4);
+      const sampleCount = dv.getUint32(stsz.start + 8);
+      if (!sampleCount) continue;
+      const sizes = new Uint32Array(sampleCount);
+      if (uniformSize) sizes.fill(uniformSize);
+      else for (let i = 0; i < sampleCount; i++) sizes[i] = dv.getUint32(stsz.start + 12 + i * 4);
+
+      // Desplazamientos de chunks (stco / co64)
+      const chunkBox = stco || co64;
+      const chunkCount = dv.getUint32(chunkBox.start + 4);
+      const chunkOffsets = new Float64Array(chunkCount);
+      if (stco) for (let i = 0; i < chunkCount; i++) chunkOffsets[i] = dv.getUint32(stco.start + 8 + i * 4);
+      else for (let i = 0; i < chunkCount; i++) chunkOffsets[i] = mp4ReadU64(dv, co64.start + 8 + i * 8);
+
+      // Muestras por chunk (stsc) -> offset exacto de cada muestra
+      const stscCount = dv.getUint32(stsc.start + 4);
+      const offsets = new Float64Array(sampleCount);
+      let sIdx = 0;
+      for (let i = 0; i < stscCount && sIdx < sampleCount; i++) {
+        const firstChunk = dv.getUint32(stsc.start + 8 + i * 12) - 1;
+        const perChunk = dv.getUint32(stsc.start + 12 + i * 12);
+        const nextChunk = i + 1 < stscCount ? dv.getUint32(stsc.start + 8 + (i + 1) * 12) - 1 : chunkCount;
+        for (let c = firstChunk; c < nextChunk && c < chunkCount && sIdx < sampleCount; c++) {
+          let off = chunkOffsets[c];
+          for (let k = 0; k < perChunk && sIdx < sampleCount; k++) {
+            offsets[sIdx] = off;
+            off += sizes[sIdx];
+            sIdx++;
+          }
+        }
       }
-      let unique = 0;
-      for (let i = 0; i < frames.length; i++) if (i === 0 || !sameBytes(frames[i].fp, frames[i - 1].fp)) unique++;
-      log("info", "video:cuadros", { metodo, cuadros: frames.length, distintos: unique, mostrados: res.presented, fpsCaptura: fps, ladoCaptura: side, ms: Math.round(performance.now() - t0), ancho: v.videoWidth, alto: v.videoHeight, duracionVideo: v.duration, desfase: offset });
-      if (offset > 0) log("info", "video:desfase", `El video empieza en ${offset.toFixed(3)} s; se compensó`);
-      return frames;
-    } finally {
-      URL.revokeObjectURL(v._waasUrl);
-      v.removeAttribute("src");
-      v.load();
+
+      // Tiempos de decodificación (stts)
+      const dts = new Float64Array(sampleCount);
+      const durs = new Float64Array(sampleCount);
+      const sttsCount = dv.getUint32(stts.start + 4);
+      let tAcc = 0, si = 0;
+      for (let i = 0; i < sttsCount && si < sampleCount; i++) {
+        const cnt = dv.getUint32(stts.start + 8 + i * 8);
+        const delta = dv.getUint32(stts.start + 12 + i * 8);
+        for (let k = 0; k < cnt && si < sampleCount; k++) {
+          dts[si] = tAcc;
+          durs[si] = delta;
+          tAcc += delta;
+          si++;
+        }
+      }
+
+      // Desfase de composición (ctts, necesario para B-frames)
+      const pts = new Float64Array(sampleCount);
+      const ctts = mp4Find(stblBoxes, "ctts");
+      if (ctts) {
+        const ver = u8[ctts.start];
+        const cnt = dv.getUint32(ctts.start + 4);
+        let ci = 0;
+        for (let i = 0; i < cnt && ci < sampleCount; i++) {
+          const n = dv.getUint32(ctts.start + 8 + i * 8);
+          const off = ver === 1 ? dv.getInt32(ctts.start + 12 + i * 8) : dv.getUint32(ctts.start + 12 + i * 8);
+          for (let k = 0; k < n && ci < sampleCount; k++) { pts[ci] = dts[ci] + off; ci++; }
+        }
+      } else {
+        pts.set(dts);
+      }
+
+      // Keyframes (stss). Si no existe stss, todos los cuadros son keyframes.
+      const isKey = new Uint8Array(sampleCount);
+      const stss = mp4Find(stblBoxes, "stss");
+      if (stss) {
+        const cnt = dv.getUint32(stss.start + 4);
+        for (let i = 0; i < cnt; i++) {
+          const idx = dv.getUint32(stss.start + 8 + i * 4) - 1;
+          if (idx >= 0 && idx < sampleCount) isKey[idx] = 1;
+        }
+      } else {
+        isKey.fill(1);
+      }
+
+      // Normalizar PTS a segundos desde el primer cuadro presentado (igual que <video> con _waasOffset).
+      let minPts = Infinity;
+      for (let i = 0; i < Math.min(sampleCount, 32); i++) if (pts[i] < minPts) minPts = pts[i];
+      const basePts = Number.isFinite(minPts) ? minPts / timescale + editShiftSec : 0;
+      const ptsSec = new Float64Array(sampleCount);
+      const durSec = new Float64Array(sampleCount);
+      for (let i = 0; i < sampleCount; i++) {
+        ptsSec[i] = pts[i] / timescale + editShiftSec - basePts;
+        durSec[i] = durs[i] / timescale;
+      }
+
+      return { codecInfo, rotation, sampleCount, offsets, sizes, ptsSec, durSec, isKey };
     }
+    return null;
+  }
+
+  async function captureByWebCodecs(file, start, dur, fps, side, mode, onProgress, signal) {
+    if (typeof VideoDecoder === "undefined" || typeof EncodedVideoChunk === "undefined") {
+      throw new Error("sin VideoDecoder");
+    }
+    const track = await parseMp4Video(file);
+    if (!track) throw new Error("contenedor no MP4");
+    const cfg = { ...track.codecInfo, hardwareAcceleration: "prefer-hardware" };
+    let sup = await VideoDecoder.isConfigSupported(cfg);
+    if (!sup.supported) {
+      cfg.hardwareAcceleration = "no-preference";
+      sup = await VideoDecoder.isConfigSupported(cfg);
+    }
+    if (!sup.supported) throw new Error("codec no soportado por VideoDecoder: " + cfg.codec);
+
+    const n = Math.max(1, Math.round(dur * fps));
+    const T = Array.from({ length: n }, (_, k) => start + (k + 0.5) / fps);
+    const tEnd = start + dur;
+
+    // Buscar el último keyframe en o antes de start, y el último cuadro necesario para tEnd.
+    let kfIdx = 0;
+    for (let i = 0; i < track.sampleCount; i++) {
+      if (track.isKey[i] && track.ptsSec[i] <= start + 0.002) kfIdx = i;
+      if (track.ptsSec[i] > start + 1.0 && i > kfIdx) break;
+    }
+    let endIdx = track.sampleCount - 1;
+    for (let i = kfIdx; i < track.sampleCount; i++) {
+      if (track.ptsSec[i] > tEnd + 0.25) { endIdx = Math.min(track.sampleCount - 1, i + 4); break; }
+    }
+
+    // Leer solo el rango de bytes del archivo que cubre [kfIdx..endIdx].
+    let minOff = Infinity, maxEnd = 0;
+    for (let i = kfIdx; i <= endIdx; i++) {
+      const o = track.offsets[i], e = o + track.sizes[i];
+      if (o < minOff) minOff = o;
+      if (e > maxEnd) maxEnd = e;
+    }
+    checkAbort(signal);
+    const chunkBuf = new Uint8Array(await file.slice(minOff, maxEnd).arrayBuffer());
+
+    const snap = makeSnapper(side, mode, track.rotation);
+    const slots = new Array(n);
+    let next = 0, pendingFirst = 0, presented = 0;
+    let pendingFrame = null, lastSnap = null, decError = null;
+
+    const decoder = new VideoDecoder({
+      output: (vf) => {
+        presented++;
+        if (decError || (signal && signal.aborted) || next >= n) { vf.close(); return; }
+        const mt = vf.timestamp / 1e6;
+        if (pendingFrame && T[next] < mt - 1e-4) {
+          lastSnap = snap(pendingFrame);
+          lastSnap.used = true;
+          pendingFrame.close();
+          pendingFrame = null;
+          while (next < n && T[next] < mt - 1e-4) slots[next++] = lastSnap;
+        } else if (!pendingFrame) {
+          while (next < n && T[next] < mt - 1e-4) { pendingFirst++; next++; }
+        }
+        if (pendingFrame) { pendingFrame.close(); pendingFrame = null; }
+        if (next >= n) { vf.close(); return; }
+        pendingFrame = vf;
+        if (pendingFirst) {
+          lastSnap = snap(pendingFrame);
+          lastSnap.used = true;
+          pendingFrame.close();
+          pendingFrame = null;
+          for (let i = 0; i < pendingFirst; i++) slots[i] = lastSnap;
+          pendingFirst = 0;
+        }
+        if (onProgress && (presented % 10 === 0 || next >= n)) {
+          onProgress(`Leyendo cuadros ${next}/${n}`, next / n);
+        }
+      },
+      error: (e) => { decError = e; },
+    });
+
+    try {
+      decoder.configure(cfg);
+      for (let i = kfIdx; i <= endIdx; i++) {
+        checkAbort(signal);
+        if (decError) throw decError;
+        if (next >= n) break;
+        const rel = track.offsets[i] - minOff;
+        const data = chunkBuf.subarray(rel, rel + track.sizes[i]);
+        decoder.decode(new EncodedVideoChunk({
+          type: track.isKey[i] ? "key" : "delta",
+          timestamp: Math.round(track.ptsSec[i] * 1e6),
+          duration: Math.round(track.durSec[i] * 1e6),
+          data,
+        }));
+        if (decoder.decodeQueueSize >= 16) {
+          await new Promise((r) => setTimeout(r, 0));
+        }
+      }
+      await decoder.flush();
+      if (decError) throw decError;
+      if (next < n && pendingFrame) {
+        lastSnap = snap(pendingFrame);
+        lastSnap.used = true;
+        pendingFrame.close();
+        pendingFrame = null;
+      }
+      while (next < n && lastSnap) slots[next++] = lastSnap;
+      if (next < n) throw new Error("VideoDecoder no produjo suficientes cuadros");
+      if (onProgress) onProgress(`Leyendo cuadros ${n}/${n}`, 1);
+      return {
+        slots,
+        presented,
+        width: track.rotation === 90 || track.rotation === 270 ? track.codecInfo.codedHeight : track.codecInfo.codedWidth,
+        height: track.rotation === 90 || track.rotation === 270 ? track.codecInfo.codedWidth : track.codecInfo.codedHeight,
+      };
+    } catch (e) {
+      for (const s of new Set(slots.filter(Boolean).concat(lastSnap ? [lastSnap] : []))) {
+        if (s.bmp) s.bmp.close();
+        else s.bmpPromise.then((b) => b.close());
+      }
+      throw e;
+    } finally {
+      if (pendingFrame) { try { pendingFrame.close(); } catch {} }
+      try { decoder.close(); } catch {}
+    }
+  }
+
+  // Por defecto intenta WebCodecs (decodificación secuencial sin saltos); si no aplica, usa <video>.
+  async function captureFrames(file, start, dur, fps, side, mode, onProgress, signal, method = "webcodecs") {
+    const t0 = performance.now();
+    let res, metodo, width = 0, height = 0, duration = 0, offset = 0;
+
+    if (method === "webcodecs") {
+      try {
+        metodo = "webcodecs";
+        res = await captureByWebCodecs(file, start, dur, fps, side, mode, onProgress, signal);
+        width = res.width;
+        height = res.height;
+      } catch (e) {
+        if (e && e.name === "AbortError") throw e;
+        log("info", "video:captura-respaldo", { fallo: "webcodecs", motivo: String(e && e.message || e) });
+        res = null;
+      }
+    }
+
+    if (!res) {
+      let v = await loadVideo(file);
+      try {
+        if (!v.videoWidth || !v.videoHeight) throw new Error("El video no tiene imagen (¿es solo audio?)");
+        offset = v._waasOffset || 0;
+        width = v.videoWidth;
+        height = v.videoHeight;
+        duration = v.duration;
+        const methods = method === "reproduccion" ? ["reproduccion", "saltos"] : ["saltos", "reproduccion"];
+        for (let i = 0; i < methods.length; i++) {
+          metodo = methods[i];
+          try {
+            res = metodo === "saltos"
+              ? await captureBySeeking(v, offset + start, dur, fps, side, mode, onProgress, signal)
+              : await captureByPlayback(v, offset + start, dur, fps, side, mode, onProgress, signal);
+            break;
+          } catch (e) {
+            if ((e && e.name === "AbortError") || i === methods.length - 1) throw e;
+            log("info", "video:captura-respaldo", { fallo: metodo, motivo: String(e && e.message || e) });
+            URL.revokeObjectURL(v._waasUrl);
+            v = await loadVideo(file);
+          }
+        }
+      } finally {
+        URL.revokeObjectURL(v._waasUrl);
+        v.removeAttribute("src");
+        v.load();
+      }
+    }
+
+    // Resolver los bitmaps y deduplicar referencias.
+    const frames = [];
+    const cache = new Map();
+    for (const s of res.slots) {
+      if (!cache.has(s)) cache.set(s, { bmp: s.bmp || await s.bmpPromise, fp: s.fp });
+      frames.push(cache.get(s));
+    }
+    let unique = 0;
+    for (let i = 0; i < frames.length; i++) if (i === 0 || !sameBytes(frames[i].fp, frames[i - 1].fp)) unique++;
+    log("info", "video:cuadros", { metodo, cuadros: frames.length, distintos: unique, mostrados: res.presented, fpsCaptura: fps, ladoCaptura: side, ms: Math.round(performance.now() - t0), ancho: width, alto: height, duracionVideo: duration, desfase: offset });
+    if (offset > 0) log("info", "video:desfase", `El video empieza en ${offset.toFixed(3)} s; se compensó`);
+    return frames;
   }
 
   // ---------------------------------------------------------------- GIF e imágenes
@@ -409,11 +892,42 @@
     const blob = await canvas.convertToBlob({ type: "image/webp", quality });
     if (blob.type !== "image/webp") throw new Error("Este navegador no puede generar WebP (devolvió " + blob.type + "). Usa Chrome o Edge.");
     const bytes = new Uint8Array(await blob.arrayBuffer());
+    // Camino rápido sin copias: la mayoría de cuadros sin alfa son RIFF + WEBP + un solo chunk VP8/VP8L.
+    if (bytes.length > 20) {
+      const f0 = String.fromCharCode(bytes[12], bytes[13], bytes[14], bytes[15]);
+      if (f0 === "VP8 " || f0 === "VP8L") {
+        const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        const sz = dv.getUint32(16, true);
+        const end = 20 + sz + (sz & 1);
+        if (end <= bytes.length) {
+          return { payload: bytes.subarray(12, end), hasAlpha: f0 === "VP8L" };
+        }
+      }
+    }
     const parts = readChunks(bytes).filter((c) => c.fourcc === "ALPH" || c.fourcc === "VP8 " || c.fourcc === "VP8L");
     if (!parts.some((c) => c.fourcc === "VP8 " || c.fourcc === "VP8L")) throw new Error("WebP sin datos de imagen");
     const payload = concat(parts.map((c) => chunk(c.fourcc, c.data)));
     const hasAlpha = parts.some((c) => c.fourcc === "ALPH" || c.fourcc === "VP8L");
     return { payload, hasAlpha };
+  }
+
+  // Solo mide el peso exacto de los chunks de imagen (ALPH + VP8/VP8L) sin copiar ni concatenar.
+  async function measureStaticFrameBytes(bitmap, quality, canvas, ctx) {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    const blob = await canvas.convertToBlob({ type: "image/webp", quality });
+    if (blob.type !== "image/webp") throw new Error("Este navegador no puede generar WebP (devolvió " + blob.type + "). Usa Chrome o Edge.");
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    let total = 0, i = 12;
+    while (i + 8 <= bytes.length) {
+      const f = String.fromCharCode(bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]);
+      const sz = dv.getUint32(i + 4, true);
+      const step = 8 + sz + (sz & 1);
+      if (f === "ALPH" || f === "VP8 " || f === "VP8L") total += step;
+      i += step;
+    }
+    return total;
   }
 
   function buildAnimatedWebp(frames, exif, side = SIDE) {
@@ -493,45 +1007,76 @@
     return out;
   }
 
-  // Codifica el sticker para un lado y fps dados. Empieza con la calidad del lado y la baja
-  // solo si hace falta para no pasar de 1 MB.
-  async function encodeWebp(an, side, fps, exifMeta, { onProgress, signal, syncMs = 0, still = false }) {
+  // Codifica el sticker para un lado y fps dados. Empieza en la calidad estimada que quepa
+  // (evita una pasada entera desperdiciada en opciones amarillas) y codifica cuadros en paralelo.
+  async function encodeWebp(an, side, fps, exifMetaOrPromise, { onProgress, signal, syncMs = 0, still = false }) {
     const { frames, dur, captureFps } = an;
-    const canvas = new OffscreenCanvas(side, side);
-    const ctx = canvas.getContext("2d");
     const p = plan(frames.length, dur, fps, captureFps);
+    // Colapsar cuadros consecutivos idénticos una sola vez antes del bucle de calidades.
+    const runs = [];
+    const uniqueFrames = [];
+    const seenFrame = new Set();
+    let prevF = null;
+    for (let k = 0; k < p.length; k++) {
+      const f = frames[p[k].idx];
+      if (runs.length && prevF && (f === prevF || sameBytes(f.fp, prevF.fp))) {
+        runs[runs.length - 1].durationMs += p[k].durationMs;
+        continue;
+      }
+      runs.push({ f, durationMs: p[k].durationMs });
+      prevF = f;
+      if (!seenFrame.has(f)) { seenFrame.add(f); uniqueFrames.push(f); }
+    }
+
     const qStart = Q_BY_SIDE[side] || 0.5;
     const qList = [];
     for (let q = qStart; q >= Q_MIN - 1e-9; q -= 0.1) qList.push(+q.toFixed(2));
     if (qList[qList.length - 1] > Q_MIN) qList.push(Q_MIN);
+
+    // Si ya tenemos muestra del análisis, saltar directo a la mayor calidad estimada que quepa.
+    let startIdx = 0;
+    if (an.sampleBytes && an.sampleBytes[side] && !still) {
+      for (let i = 0; i < qList.length - 1; i++) {
+        const est = (sampleAvg(an, side, qList[i]) + 32) * runs.length + 400;
+        if (est <= MAX_STICKER_BYTES * 1.02) { startIdx = i; break; }
+        startIdx = i + 1;
+      }
+    }
+
+    const pool = createCanvasPool(side, Math.min(ENCODE_CONCURRENCY, uniqueFrames.length));
     const attempts = [];
     let best = null;
-    for (let i = 0; i < qList.length; i++) {
+    let exifBytes = null;
+    for (let i = startIdx; i < qList.length; i++) {
       const q = qList[i];
       // Con la muestra del análisis se salta directo a una calidad que probablemente quepa.
       if (best && an.sampleBytes && i < qList.length - 1) {
         const ratio = sampleAvg(an, side, q) / sampleAvg(an, side, best.q);
         if (ratio > 0 && best.bytes.length * ratio > MAX_STICKER_BYTES * 0.98) { attempts.push({ q, saltado: true, previsto: Math.round(best.bytes.length * ratio) }); continue; }
       }
+      let encodedCount = 0;
+      const encodedArr = await runPool(uniqueFrames, pool, async (f, _idx, slot) => {
+        const enc = await encodeStaticFrame(f.bmp, q, slot.canvas, slot.ctx);
+        encodedCount++;
+        if (onProgress && (encodedCount % 8 === 0 || encodedCount === uniqueFrames.length)) {
+          onProgress(`Codificando (${side} px, ${fps} fps, calidad ${Math.round(q * 100)}) ${encodedCount}/${uniqueFrames.length}`, 0.1 + 0.85 * (encodedCount / uniqueFrames.length));
+        }
+        return enc;
+      }, signal);
       const cache = new Map();
+      for (let u = 0; u < uniqueFrames.length; u++) cache.set(uniqueFrames[u], encodedArr[u]);
+
       const out = [];
-      let prevF = null;
-      for (let k = 0; k < p.length; k++) {
-        checkAbort(signal);
-        const f = frames[p[k].idx];
+      for (let r = 0; r < runs.length; r++) {
+        const enc = cache.get(runs[r].f);
         const prev = out[out.length - 1];
-        // Cuadro repetido (mismo criterio que la estimación): se alarga el anterior y no se codifica.
-        if (prev && prevF && (f === prevF || sameBytes(f.fp, prevF.fp))) { prev.durationMs += p[k].durationMs; continue; }
-        let enc = cache.get(f);
-        if (!enc) { enc = await encodeStaticFrame(f.bmp, q, canvas, ctx); cache.set(f, enc); }
-        prevF = f;
-        if (prev && sameBytes(prev.payload, enc.payload)) prev.durationMs += p[k].durationMs;
-        else out.push({ payload: enc.payload, hasAlpha: enc.hasAlpha, durationMs: p[k].durationMs });
-        if (onProgress && k % 10 === 0) onProgress(`Codificando (${side} px, ${fps} fps, calidad ${Math.round(q * 100)}) ${k + 1}/${p.length}`, (k + 1) / p.length);
+        if (prev && sameBytes(prev.payload, enc.payload)) prev.durationMs += runs[r].durationMs;
+        else out.push({ payload: enc.payload, hasAlpha: enc.hasAlpha, durationMs: runs[r].durationMs });
       }
       // Compensación de desfase: el primer cuadro se muestra syncMs más, para que la imagen espere al audio.
       if (syncMs > 0 && !still) out[0] = { ...out[0], durationMs: out[0].durationMs + syncMs };
-      const bytes = still ? buildStillWebp(out[0], exifWhatsApp(exifMeta), side) : buildAnimatedWebp(out, exifWhatsApp(exifMeta), side);
+      if (!exifBytes) exifBytes = exifWhatsApp(await exifMetaOrPromise);
+      const bytes = still ? buildStillWebp(out[0], exifBytes, side) : buildAnimatedWebp(out, exifBytes, side);
       attempts.push({ q, bytes: bytes.length, cuadros: out.length });
       best = { bytes, side, fps, q, frames: out.length };
       if (bytes.length <= MAX_STICKER_BYTES) break;
@@ -842,25 +1387,45 @@
       }
       distinct[f] = d;
     }
-    // Muestra: hasta 24 cuadros distintos repartidos por el tramo, con un desplazamiento
-    // irregular para no coincidir con contenidos que se repiten en ciclos (p. ej. cada segundo).
+    // Muestra: hasta 12 cuadros distintos repartidos por el tramo con desplazamiento áureo.
+    // Se miden resoluciones ancla (cada 2 pasos, incluyendo extremos) en paralelo con un pool
+    // de OffscreenCanvas y se interpolan en escala log-log las resoluciones intermedias.
     const uniq = [];
     for (let i = 0; i < frames.length; i++) if (!i || (frames[i] !== frames[i - 1] && !sameBytes(frames[i].fp, frames[i - 1].fp))) uniq.push(frames[i]);
-    const M = Math.min(24, uniq.length);
+    const M = Math.min(12, uniq.length);
     const sample = Array.from({ length: M }, (_, i) => uniq[Math.min(uniq.length - 1, Math.floor(((i + ((i * 0.618) % 1)) * uniq.length) / M))]);
+
+    const anchorSides = sides.filter((_, i) => i === 0 || i === sides.length - 1 || i % 2 === 0);
     const sampleBytes = {};
     let done = 0;
-    for (const side of sides) {
-      const canvas = new OffscreenCanvas(side, side);
-      const ctx = canvas.getContext("2d");
+    for (const side of anchorSides) {
+      const pool = createCanvasPool(side, Math.min(ENCODE_CONCURRENCY, sample.length));
       sampleBytes[side] = {};
-      for (const q of [Q_BY_SIDE[side], 0.35, Q_MIN]) {
-        if (sampleBytes[side][q] != null) continue;
+      const qs = Q_BY_SIDE[side] === Q_MIN ? [Q_MIN] : [Q_BY_SIDE[side], Q_MIN];
+      for (const q of qs) {
+        const sizes = await runPool(sample, pool, (f, _idx, slot) => measureStaticFrameBytes(f.bmp, q, slot.canvas, slot.ctx), signal);
         let sum = 0;
-        for (const f of sample) { checkAbort(signal); sum += (await encodeStaticFrame(f.bmp, q, canvas, ctx)).payload.length; }
-        sampleBytes[side][q] = sum / sample.length;
+        for (let i = 0; i < sizes.length; i++) sum += sizes[i];
+        sampleBytes[side][q] = sum / sizes.length;
       }
-      prog("Calculando opciones…", 0.8 + (0.2 * ++done) / sides.length);
+      prog("Calculando opciones…", 0.8 + (0.2 * ++done) / anchorSides.length);
+    }
+    // Interpolar en escala log-log las resoluciones intermedias (el peso WebP sigue una ley de potencia).
+    const logInterp = (s, sHi, sLo, bHi, bLo) => {
+      if (bHi <= 0 || bLo <= 0) return (bHi + bLo) / 2;
+      const t = Math.log(s / sLo) / Math.log(sHi / sLo);
+      return Math.exp(Math.log(bLo) + t * (Math.log(bHi) - Math.log(bLo)));
+    };
+    for (const side of sides) {
+      if (sampleBytes[side]) continue;
+      let sHi = anchorSides[0], sLo = anchorSides[anchorSides.length - 1];
+      for (let i = 0; i < anchorSides.length - 1; i++) {
+        if (anchorSides[i] >= side && anchorSides[i + 1] <= side) { sHi = anchorSides[i]; sLo = anchorSides[i + 1]; break; }
+      }
+      sampleBytes[side] = {
+        [Q_BY_SIDE[side]]: logInterp(side, sHi, sLo, sampleBytes[sHi][Q_BY_SIDE[sHi]], sampleBytes[sLo][Q_BY_SIDE[sLo]]),
+        [Q_MIN]: logInterp(side, sHi, sLo, sampleBytes[sHi][Q_MIN], sampleBytes[sLo][Q_MIN]),
+      };
     }
     const overhead = 32; // cabecera ANMF + chunk
     const cells = [];
@@ -906,24 +1471,30 @@
     const cell = an.cells.find((c) => c.side === side && c.fps === fps);
     log("info", "crear:parametros", { side, fps, compensacionMs: syncMs, estatico: still, estimado: cell && cell.est, estado: cell && cell.estado });
 
-    // Audio: la tasa de bits baja en clips largos para no pasar de 1 MB (límite de WhatsApp).
+    // Audio y WebP en paralelo: el hash del audio solo se necesita al armar el EXIF final.
     const bitrate = Math.max(12000, Math.min(32000, Math.floor((0.9 * MAX_AUDIO_BYTES * 8) / A.dur)));
     if ((bitrate / 8) * A.dur > 0.97 * MAX_AUDIO_BYTES) throw new Error(`Con ${Math.round(A.dur)} s el audio no cabe en 1 MB (límite de WhatsApp). Máximo unos ${Math.floor((0.9 * MAX_AUDIO_BYTES * 8) / 12000 / 60)} minutos.`);
-    prog("Extrayendo audio…", 0);
-    // Un audio aparte se corta donde el usuario quiera: se suaviza el corte para evitar clics.
-    const pcm = await extractAudio(A.file, A.start, A.dur, A.file !== an.visual.file ? 8 : 0);
-    checkAbort(signal);
-    prog("Codificando audio…", 0.05);
-    const { packets, preSkip, config } = await encodeOpus(pcm, bitrate);
-    const ogg = buildOggOpus(packets, preSkip, pcm.length);
-    if (ogg.length > MAX_AUDIO_BYTES) throw new Error(`El audio pesa ${Math.round(ogg.length / 1000)} KB (máximo 1000 KB)`);
-    const soundSha = await sha256b64(ogg);
-    const oggCheck = await verifyOgg(ogg);
-    log(oggCheck.ok ? "info" : "error", "audio:ogg", { bytes: ogg.length, paquetes: packets.length, preSkip, config, verificacion: oggCheck, soundSha256: soundSha });
-    if (!oggCheck.ok) throw new Error("El audio generado no se puede reproducir: " + oggCheck.error);
+    prog("Codificando audio y video…", 0.05);
+    const audioPromise = (async () => {
+      // Un audio aparte se corta donde el usuario quiera: se suaviza el corte para evitar clics.
+      const pcm = await extractAudio(A.file, A.start, A.dur, A.file !== an.visual.file ? 8 : 0);
+      checkAbort(signal);
+      const { packets, preSkip, config } = await encodeOpus(pcm, bitrate);
+      const ogg = buildOggOpus(packets, preSkip, pcm.length);
+      if (ogg.length > MAX_AUDIO_BYTES) throw new Error(`El audio pesa ${Math.round(ogg.length / 1000)} KB (máximo 1000 KB)`);
+      const soundSha = await sha256b64(ogg);
+      const oggCheck = await verifyOgg(ogg);
+      log(oggCheck.ok ? "info" : "error", "audio:ogg", { bytes: ogg.length, paquetes: packets.length, preSkip, config, verificacion: oggCheck, soundSha256: soundSha });
+      if (!oggCheck.ok) throw new Error("El audio generado no se puede reproducir: " + oggCheck.error);
+      const exifMeta = await stickerMeta({ packName, publisher, soundSha });
+      return { ogg, soundSha, exifMeta };
+    })();
 
-    const exifMeta = await stickerMeta({ packName, publisher, soundSha });
-    const w = await encodeWebp(an, side, fps, exifMeta, { onProgress: prog, signal, syncMs, still });
+    const [audioRes, w] = await Promise.all([
+      audioPromise,
+      encodeWebp(an, side, fps, audioPromise.then((a) => a.exifMeta), { onProgress: prog, signal, syncMs, still }),
+    ]);
+    const { ogg, soundSha, exifMeta } = audioRes;
     const info = {
       tipo: an.visual.kind, ajuste: an.fit,
       duracion: dur, duracionAudio: A.dur, segundosAudio: Math.max(1, Math.round(A.dur)),
